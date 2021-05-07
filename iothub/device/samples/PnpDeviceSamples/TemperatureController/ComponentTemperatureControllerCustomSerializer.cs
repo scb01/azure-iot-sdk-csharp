@@ -5,6 +5,7 @@ using System;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Azure.Devices.Shared;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.Devices.Client.Samples
@@ -15,7 +16,6 @@ namespace Microsoft.Azure.Devices.Client.Samples
         private const string Thermostat2 = "thermostat2";
 
         private static readonly Random s_random = new();
-        private static readonly PayloadConvention s_systemTextJsonPayloadConvention = new SystemTextJsonPayloadConvention();
 
         private readonly DeviceClient _deviceClient;
         private readonly ILogger _logger;
@@ -37,26 +37,50 @@ namespace Microsoft.Azure.Devices.Client.Samples
 
         public async Task PerformOperationsAsync(CancellationToken cancellationToken)
         {
+            // Send telemetry "deviceHealth" under component "thermostat1".
+            var deviceHealth = new DeviceHealthNewtonSystemText
+            {
+                Status = "running",
+                IsStopRequested = false,
+            };
+
+            using var message = new TelemetryMessage(Thermostat1)
+            {
+                MessageId = s_random.Next().ToString(),
+                Telemetry = new TelemetryCollection
+                {
+                    ["deviceHealth"] = deviceHealth
+                },
+            };
+            await _deviceClient.SendTelemetryAsync(message, cancellationToken);
+            _logger.LogDebug($"Telemetry: Sent - {message.Telemetry.GetSerializedString()}.");
+
             // Retrieve the device's properties.
             ClientProperties properties = await _deviceClient.GetClientPropertiesAsync(cancellationToken);
 
             // Verify if the device has previously reported a value for property
             // "initialValue" under component "thermostat2".
             // If the expected value has not been previously reported then report it.
-            var initialValue = new ThermostatInitialValue
+            var initialValue = new ThermostatInitialValueSystemTextJson
             {
                 Humidity = 20,
                 Temperature = 25
             };
 
-            if (!properties.Contains("initialValue", Thermostat2))
+            if (!properties.TryGetValue(
+                    Thermostat2,
+                    "initialValue",
+                    out ThermostatInitialValueSystemTextJson retrievedInitialValue)
+                || !retrievedInitialValue.Equals(initialValue))
             {
                 var propertiesToBeUpdated = new ClientPropertyCollection
                 {
                     { "initialValue", initialValue, Thermostat2 }
                 };
-                await _deviceClient.UpdateClientPropertiesAsync(propertiesToBeUpdated, cancellationToken);
-                _logger.LogDebug($"Property: Update - {propertiesToBeUpdated.GetSerializedString()}.");
+                ClientPropertiesUpdateResponse updateResponse = await _deviceClient
+                    .UpdateClientPropertiesAsync(propertiesToBeUpdated, cancellationToken);
+                _logger.LogDebug($"Property: Update - {propertiesToBeUpdated.GetSerializedString()}," +
+                    $" version = {updateResponse.Version}.");
             }
             else
             {
@@ -65,47 +89,35 @@ namespace Microsoft.Azure.Devices.Client.Samples
                 _logger.LogDebug($"Property from tValue: {tValue.Temperature}.");
             }
 
-            // Send telemetry "deviceHealth" under component "thermostat1".
-            var deviceHealth = new DeviceHealth
-            {
-                Status = "running",
-                IsStopRequested = false,
-            };
-            using var message = new TelemetryMessage(Thermostat1)
-            {
-                MessageId = s_random.Next().ToString(),
-                Telemetry = new TelemetryCollection()
-                {
-                    ["deviceHealth"] = deviceHealth
-                },
-            };
-            await _deviceClient.SendTelemetryAsync(message, cancellationToken);
-            _logger.LogDebug($"Telemetry: Sent - {message.Telemetry.GetSerializedString()}.");
-
-            // Subscribe and respond to event for writable property "humidityRange" under component "thermostat1".
+            // Subscribe and respond to event for writable property "humidityRange"
+            // under component "thermostat1".
             await _deviceClient.SubscribeToWritablePropertiesEventAsync(
                 async (writableProperties, userContext) =>
                 {
                     string propertyName = "humidityRange";
-                    if (!writableProperties.Contains(Thermostat1)
-                        || !((JsonElement)writableProperties[Thermostat1])
-                            .TryGetProperty(propertyName, out JsonElement humidityRangeRequested))
+                    if (!writableProperties.TryGetValue(
+                            Thermostat1,
+                            "humidityRange",
+                            out HumidityRangeSystemTextJson humidityRangeRequested))
                     {
-                        _logger.LogDebug($"Property: Update - Received a property update which is not implemented.\n{writableProperties.GetSerializedString()}");
+                        _logger.LogDebug($"Property: Update - Received a property update" +
+                            $" which is not implemented.\n{writableProperties.GetSerializedString()}");
                         return;
                     }
 
-                    HumidityRange targetHumidityRange = _deviceClient.PayloadConvention.PayloadSerializer.DeserializeToType<HumidityRange>(humidityRangeRequested.GetRawText());
-
-                    _logger.LogDebug($"Property: Received - component=\"{Thermostat1}\", {{ \"{propertyName}\": {targetHumidityRange} }}.");
+                    _logger.LogDebug($"Property: Received - component=\"{Thermostat1}\"," +
+                        $" {{ \"{propertyName}\": {humidityRangeRequested} }}.");
 
                     var propertyPatch = new ClientPropertyCollection
                     {
-                        { propertyName, targetHumidityRange, (int)StatusCode.Completed, writableProperties.Version, "The operation completed successfully.", Thermostat1 }
+                        { propertyName, humidityRangeRequested, StatusCodes.OK,
+                            writableProperties.Version, "The operation completed successfully.", Thermostat1 }
                     };
 
-                    await _deviceClient.UpdateClientPropertiesAsync(propertyPatch, cancellationToken);
-                    _logger.LogDebug($"Property: Update - \"{propertyPatch.GetSerializedString()}\" is complete.");
+                    ClientPropertiesUpdateResponse updateResponse = await _deviceClient
+                        .UpdateClientPropertiesAsync(propertyPatch, cancellationToken);
+                    _logger.LogDebug($"Property: Update - \"{propertyPatch.GetSerializedString()}\"," +
+                        $" version = {updateResponse.Version} is complete.");
                 },
                 null,
                 cancellationToken);
@@ -116,27 +128,28 @@ namespace Microsoft.Azure.Devices.Client.Samples
                 {
                     try
                     {
-                        UpdateTemperatureRequest updateTemperatureRequest = commandRequest.GetData<UpdateTemperatureRequest>();
+                        UpdateTemperatureRequestSystemTextJson updateTemperatureRequest = commandRequest
+                            .GetData<UpdateTemperatureRequestSystemTextJson>();
 
                         _logger.LogDebug($"Command: Received - component=\"{commandRequest.ComponentName}\"," +
                             $" updating temperature reading to {updateTemperatureRequest.TargetTemperature}°C after {updateTemperatureRequest.Delay} seconds).");
                         await Task.Delay(TimeSpan.FromSeconds(updateTemperatureRequest.Delay));
 
-                        var updateTemperatureResponse = new UpdateTemperatureResponse
+                        var updateTemperatureResponse = new UpdateTemperatureResponseSystemTextJson
                         {
                             TargetTemperature = updateTemperatureRequest.TargetTemperature,
-                            Status = (int)StatusCode.Completed
+                            Status = StatusCodes.OK
                         };
 
                         _logger.LogDebug($"Command: component=\"{commandRequest.ComponentName}\", target temperature {updateTemperatureResponse.TargetTemperature}°C" +
-                                    $" has {StatusCode.Completed}.");
+                                    $" has {StatusCodes.OK}.");
 
-                        return new CommandResponse(updateTemperatureResponse, (int)StatusCode.Completed);
+                        return new CommandResponse(updateTemperatureResponse, StatusCodes.OK);
                     }
                     catch (JsonException ex)
                     {
                         _logger.LogDebug($"Command input is invalid: {ex.Message}.");
-                        return new CommandResponse((int)StatusCode.BadRequest);
+                        return new CommandResponse(StatusCodes.BadRequest);
                     }
                 },
                 null,
